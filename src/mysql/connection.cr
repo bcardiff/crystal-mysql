@@ -21,8 +21,14 @@ class MySql::Connection < DB::Connection
       @socket = TCPSocket.new(host, port)
       handshake = read_packet(Protocol::HandshakeV10)
 
+      handshake_response = Protocol::HandshakeResponse41.new(username, password, initial_catalog, handshake.auth_plugin_data, handshake.plugin_name)
+
       write_packet(1) do |packet|
-        Protocol::HandshakeResponse41.new(username, password, initial_catalog, handshake.auth_plugin_data).write(packet)
+        handshake_response.write(packet)
+      end
+
+      if handshake_response.expect_public_key_retrieval
+        # TODO
       end
 
       read_ok_or_err do |packet, status|

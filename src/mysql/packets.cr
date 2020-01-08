@@ -3,8 +3,10 @@ require "openssl/sha1"
 module MySql::Protocol
   struct HandshakeV10
     getter auth_plugin_data : Bytes
+    getter capabilities : Int32
+    getter plugin_name : String
 
-    def initialize(@auth_plugin_data)
+    def initialize(@auth_plugin_data, @capabilities, @plugin_name)
     end
 
     def self.read(packet : MySql::ReadPacket)
@@ -22,13 +24,15 @@ module MySql::Protocol
       cap3 = packet.read_byte!
       cap4 = packet.read_byte!
 
+      capabilities = cap1.to_i + (cap2.to_i << 8) + (cap3.to_i << 16) + (cap4.to_i << 24)
+
       auth_plugin_data_length = packet.read_byte!
       packet.read_byte_array(10)
       packet.read_fully(auth_data[8, {13, auth_plugin_data_length.to_i16 - 8}.max - 1])
       packet.read_byte!
-      packet.read_string
+      plugin_name = packet.read_string
 
-      HandshakeV10.new(auth_data)
+      HandshakeV10.new(auth_data, capabilities, plugin_name)
     end
   end
 
@@ -59,13 +63,16 @@ module MySql::Protocol
     CLIENT_SESSION_TRACK                  = 0x00800000
     CLIENT_DEPRECATE_EOF                  = 0x01000000
 
-    def initialize(@username : String?, @password : String?, @initial_catalog : String?, @auth_plugin_data : Bytes)
+    getter expect_public_key_retrieval : Bool = false
+
+    def initialize(@username : String?, @password : String?, @initial_catalog : String?,
+                   @auth_plugin_data : Bytes, @plugin_name : String)
     end
 
     def write(packet : MySql::WritePacket)
       caps = CLIENT_PROTOCOL_41 | CLIENT_SECURE_CONNECTION | CLIENT_PLUGIN_AUTH_LENENC_CLIENT_DATA
 
-      caps |= CLIENT_PLUGIN_AUTH if @password
+      caps |= CLIENT_PLUGIN_AUTH if @password || @plugin_name == "caching_sha2_password"
 
       caps |= CLIENT_CONNECT_WITH_DB if @initial_catalog
 
@@ -78,30 +85,46 @@ module MySql::Protocol
       packet << @username
       packet.write_byte 0_u8
 
-      if password = @password
-        sizet_20 = LibC::SizeT.new(20)
-        sha1 = OpenSSL::SHA1.hash(password)
-        sha1sha1 = OpenSSL::SHA1.hash(sha1.to_unsafe, sizet_20)
+      case @plugin_name
+      when "mysql_native_password"
+        if password = @password
+          sizet_20 = LibC::SizeT.new(20)
+          sha1 = OpenSSL::SHA1.hash(password)
+          sha1sha1 = OpenSSL::SHA1.hash(sha1.to_unsafe, sizet_20)
 
-        buffer = uninitialized UInt8[40]
-        buffer.to_unsafe.copy_from(@auth_plugin_data.to_unsafe, 20)
-        (buffer.to_unsafe + 20).copy_from(sha1sha1.to_unsafe, 20)
+          buffer = uninitialized UInt8[40]
+          buffer.to_unsafe.copy_from(@auth_plugin_data.to_unsafe, 20)
+          (buffer.to_unsafe + 20).copy_from(sha1sha1.to_unsafe, 20)
 
-        sizet_40 = LibC::SizeT.new(40)
-        buffer_sha1 = OpenSSL::SHA1.hash(buffer.to_unsafe, sizet_40)
+          sizet_40 = LibC::SizeT.new(40)
+          buffer_sha1 = OpenSSL::SHA1.hash(buffer.to_unsafe, sizet_40)
 
-        # reuse buffer
-        20.times { |i|
-          buffer[i] = sha1[i] ^ buffer_sha1[i]
-        }
+          # reuse buffer
+          20.times { |i|
+            buffer[i] = sha1[i] ^ buffer_sha1[i]
+          }
 
-        auth_response = Bytes.new(buffer.to_unsafe, 20)
+          auth_response = Bytes.new(buffer.to_unsafe, 20)
 
-        # packet.write_byte 0_u8
-        packet.write_lenenc_int 20
-        packet.write(auth_response)
+          # packet.write_byte 0_u8
+          packet.write_lenenc_int 20
+          packet.write(auth_response)
+        else
+          packet.write_byte 0_u8
+        end
+      when "caching_sha2_password"
+        # Public key retrieval
+        # https://dev.mysql.com/doc/internals/en/public-key-retrieval.html
+
+        if password = @password
+          @expect_public_key_retrieval = true
+          packet.write_lenenc_int 1
+          packet.write_byte 0_u8
+        else
+          packet.write_byte 0_u8
+        end
       else
-        packet.write_byte 0_u8
+        raise "Unsupported '#{@plugin_name}' plugin"
       end
 
       if initial_catalog = @initial_catalog
@@ -109,9 +132,12 @@ module MySql::Protocol
         packet.write_byte 0_u8
       end
 
-      if @password
-        packet << "mysql_native_password"
+      case @plugin_name
+      when "mysql_native_password", "caching_sha2_password"
+        packet << @plugin_name
         packet.write_byte 0_u8
+      else
+        raise "Unsupported '#{@plugin_name}' plugin"
       end
     end
   end
