@@ -7,14 +7,32 @@ class MySql::ReadPacket < IO
     @length = 0
     @remaining = 0
     @seq = 0u8
+    @header = uninitialized UInt8[4]
     begin
-      header = uninitialized UInt8[4]
-      io.read_fully(header.to_slice)
-      @length = @remaining = header[0].to_i + (header[1].to_i << 8) + (header[2].to_i << 16)
-      @seq = header[3]
+      io.read_fully(@header.to_slice)
+      @length = @remaining = @header[0].to_i + (@header[1].to_i << 8) + (@header[2].to_i << 16)
+      @seq = @header[3]
+      # TODO -------- in case of more messages back and forth (other authentication than today)
+      #
+      # in_seq = @header[3]
+      # if in_seq == 0
+      #   # assuming the server resets the squence
+      #   connection.sequence = in_seq
+      # else
+      #   if in_seq != connection.sequence
+      #     raise "sequence out of order at read init got=#{in_seq} have=#{connection.sequence}"
+      #   end
+      # end
+      # prepare for next read or next write
+      # connection.sequence_increase
+      # ----------------
     rescue e : IO::EOFError
       raise DB::ConnectionLost.new(@connection, cause: e)
     end
+  end
+
+  def remaining
+    @remaining
   end
 
   def to_s(io)

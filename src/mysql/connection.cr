@@ -1,6 +1,12 @@
 require "socket"
 
 class MySql::Connection < DB::Connection
+  enum ResponceOnCachingSha2Password : UInt8
+    CachingSha2PasswordRequestPublicKey          = 2
+    CachingSha2PasswordFastAuthSuccess
+    CachingSha2PasswordPerformFullAuthentication
+  end
+
   record Options,
     host : String,
     port : Int32,
@@ -39,13 +45,69 @@ class MySql::Connection < DB::Connection
       @socket = TCPSocket.new(mysql_options.host, mysql_options.port)
       handshake = read_packet(Protocol::HandshakeV10)
 
+      handshake_response = Protocol::HandshakeResponse41.new(mysql_options.username,
+        mysql_options.password,
+        mysql_options.initial_catalog,
+        handshake.auth_plugin_data,
+        handshake.server_plugin_name,
+        charset_id)
       write_packet(1) do |packet|
-        Protocol::HandshakeResponse41.new(mysql_options.username, mysql_options.password, mysql_options.initial_catalog, handshake.auth_plugin_data, charset_id).write(packet)
+        handshake_response.write(packet)
       end
 
-      read_ok_or_err do |packet, status|
-        raise "packet #{status} not implemented"
+      auth_anser_packet = build_read_packet
+      status = auth_anser_packet.read_byte.not_nil!
+      # -1 or -2 as signed i8
+      if status == 255 || status == 254
+        handle_err_packet auth_anser_packet
       end
+      case status
+      when 0
+        # done on mysql_native_password"
+      when 1
+        case handshake.server_plugin_name
+        when "mysql_native_password"
+          # done
+        when "caching_sha2_password"
+          len_auth_data = auth_anser_packet.remaining
+          case len_auth_data
+          when 1
+            auth_anser_packet_kind = auth_anser_packet.read_byte.not_nil!
+            case auth_anser_packet_kind
+            when ResponceOnCachingSha2Password::CachingSha2PasswordFastAuthSuccess.value
+              auth_anser_packet_3 = build_read_packet
+              status = auth_anser_packet_3.read_byte.not_nil!
+              auth_anser_packet_3.remaining.times do
+                # drain packet
+                x = auth_anser_packet_3.read_byte
+              end
+              if status != 0
+                raise "expecting status 0 but got #{status}"
+              end
+              # done
+            when ResponceOnCachingSha2Password::CachingSha2PasswordPerformFullAuthentication.value
+              auth_anser_packet.remaining.times do
+                # drain packet
+                x = auth_anser_packet.read_byte
+              end
+              raise "Connection as user '#{mysql_options.username}' and a given password denied"
+            else
+              raise "Unknown auth responce kind"
+            end
+          else
+            raise "Unknown auth responce length"
+          end
+        else
+          raise "Unexpected status in aut, got #{status}"
+        end
+      end
+      auth_anser_packet.remaining.times do
+        # drain packet
+        x = auth_anser_packet.read_byte
+      end
+
+      # sequence_reset
+      self
     rescue IO::Error
       raise DB::ConnectionRefused.new
     end
@@ -116,6 +178,7 @@ class MySql::Connection < DB::Connection
 
   # :nodoc:
   def handle_err_packet(packet)
+    # why 8, seems to be wrong sometimes??
     8.times { packet.read_byte! }
     raise packet.read_string
   end
@@ -130,7 +193,7 @@ class MySql::Connection < DB::Connection
   # :nodoc:
   def raise_if_err_packet(packet)
     status = packet.read_byte!
-    if status == 255
+    if status == 255 || status == 254
       handle_err_packet packet
     end
 
@@ -140,7 +203,7 @@ class MySql::Connection < DB::Connection
   end
 
   # :nodoc:
-  def read_column_definitions(target, column_count)
+  def read_column_definitions(target : Array(ColumnSpec), column_count : Int)
     # Parse column definitions
     # http://dev.mysql.com/doc/internals/en/com-query-response.html#packet-Protocol::ColumnDefinition
     column_count.times do
@@ -167,9 +230,19 @@ class MySql::Connection < DB::Connection
 
     if column_count > 0
       self.read_packet do |eof_packet|
-        eof_packet.read_byte # TODO assert EOF Packet
+        goteof = eof_packet.read_byte # TODO assert EOF Packet
+        if goteof == 0xfe
+          eof_packet.remaining.times do
+            # drain packet
+            x = eof_packet.read_byte
+          end
+          return 0xfe
+        else
+          raise "expected enf of file but got #{goteof}"
+        end
       end
     end
+    nil
   end
 
   def build_prepared_statement(query) : MySql::Statement
