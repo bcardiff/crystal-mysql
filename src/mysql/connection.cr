@@ -38,13 +38,14 @@ class MySql::Connection < DB::Connection
   def initialize(options : ::DB::Connection::Options, mysql_options : ::MySql::Connection::Options)
     super(options)
     @socket = uninitialized TCPSocket
+    @auth_plugin_name = "" # stored for tests
 
     begin
       charset_id = Collations.id_for_collation(mysql_options.charset).to_u8
 
       @socket = TCPSocket.new(mysql_options.host, mysql_options.port)
       handshake = read_packet(Protocol::HandshakeV10)
-
+      @auth_plugin_name = handshake.server_plugin_name
       handshake_response = Protocol::HandshakeResponse41.new(mysql_options.username,
         mysql_options.password,
         mysql_options.initial_catalog,
